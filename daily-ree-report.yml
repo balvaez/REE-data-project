@@ -1,0 +1,44 @@
+name: Daily REE Generation Report
+
+on:
+  schedule:
+    # GitHub Actions cron always runs in UTC. Spain (Europe/Madrid) is
+    # UTC+1 in winter (CET) and UTC+2 in summer (CEST), so we schedule
+    # BOTH corresponding UTC times to cover 12:00 local time year-round.
+    # The script itself checks the real local time and skips the
+    # "wrong" one of the two triggers on any given day.
+    - cron: '0 10 * * *'   # 12:00 in Madrid during CEST (summer)
+    - cron: '0 11 * * *'   # 12:00 in Madrid during CET (winter)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run immediately, ignoring the 12:00 local-time check'
+        type: boolean
+        default: true
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run report script
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          FORCE_RUN: ${{ inputs.force }}
+        run: python scripts/ree_report.py
