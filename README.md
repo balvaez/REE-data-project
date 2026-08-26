@@ -1,8 +1,8 @@
 # Daily Spain Electricity Generation Report
 
 Sends you a daily email (around 12:00 Madrid local time) with:
-- A pie chart of Spain's electricity generation mix (yesterday, full day)
-- The renewable vs. non-renewable share
+- A pie chart of Spain's electricity generation mix, cumulative from 00:00 up to the moment it runs (~12:00) that same day
+- The renewable vs. non-renewable share (computed by explicitly summing known renewable technologies — solar, wind, hydro, etc. — not by trusting REE's own category label, which is unreliable across languages)
 - A table with the breakdown by technology (GWh and %)
 
 Data comes from Red Eléctrica de España's free, public **REData API**
@@ -105,10 +105,14 @@ Some easy tweaks, all in `scripts/ree_report.py`:
 - **Different local time / timezone**: change `MADRID_TZ` and the
   `now_madrid.hour == 12` check, and adjust the two cron lines in the
   workflow to match your desired UTC offsets.
-- **Today's partial data instead of yesterday's full day**: change
-  `report_date = date.today() - timedelta(days=1)` to `date.today()`,
-  and consider fetching `start_date` as `00:00` up to the current time
-  instead of `23:59` (the API will just return what's available so far).
+- **Full previous day instead of today so far**: change `main()` to use
+  yesterday's date with a `00:00`–`23:59` window instead of midnight-to-now
+  — useful if you'd rather have complete, final daily figures instead of
+  a partial cumulative snapshot.
+- **Renewable/non-renewable classification**: `RENEWABLE_TECHNOLOGIES` and
+  `NON_RENEWABLE_TECHNOLOGIES` are the source of truth. If REE adds a new
+  technology name you'll see an "Unrecognized technology" warning in the
+  Actions log — just add it to the relevant set.
 - **Add more figures** (e.g. peak/lowest demand, import/export balance,
   CO₂ emissions): REE's REData API has other endpoints under
   `demanda`, `intercambios`, and `balance` categories
