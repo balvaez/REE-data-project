@@ -2,10 +2,11 @@
 """
 Daily Spanish electricity generation mix report.
 
-Fetches yesterday's generation-mix data from Red Eléctrica de España's
-public REData API (apidatos.ree.es — no API key required), builds a pie
-chart of the generation mix, and emails a summary (key figures + chart)
-to the configured recipient.
+Fetches today's generation-mix data so far (from 00:00 up to the moment
+the script runs, ~12:00) from Red Eléctrica de España's public REData API
+(apidatos.ree.es — no API key required), builds a pie chart of the
+generation mix, and emails a summary (key figures + chart) to the
+configured recipient.
 
 Designed to be run once a day (around 12:00 Europe/Madrid time) from a
 GitHub Actions workflow, but works fine run locally / manually too.
@@ -15,7 +16,7 @@ import os
 import sys
 import smtplib
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,40 @@ FALLBACK_COLORS = [
     "#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2",
     "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD",
 ]
+
+# REE's API mixes in aggregate/rollup rows (e.g. "Total generation") among
+# the individual technologies in the "included" list. We identify and
+# drop those by name rather than trusting any structural flag, since
+# that's the most robust signal across API quirks.
+AGGREGATE_ROW_KEYWORDS = ("total generation", "generación total", "generacion total")
+
+# Renewable/non-renewable is determined by an explicit technology list
+# rather than trusting the API's own category field — REE's classification
+# field is returned in whatever language the endpoint is queried in (here,
+# English), and matching against it proved unreliable. This list covers
+# REE's standard "estructura-generacion" technologies in both English and
+# Spanish, lower-cased, so it works regardless of endpoint language.
+RENEWABLE_TECHNOLOGIES = {
+    "hydro", "hidráulica", "hidraulica",
+    "wind", "eólica", "eolica",
+    "solar photovoltaic", "solar fotovoltaica",
+    "solar thermal", "solar térmica", "solar termica",
+    "other renewables", "otras renovables",
+    "renewable waste", "residuos renovables",
+    "hydroeolic", "hidroeólica", "hidroeolica",
+}
+NON_RENEWABLE_TECHNOLOGIES = {
+    "nuclear",
+    "coal", "carbón", "carbon",
+    "fuel + gas", "fuel/gas", "fuel-gas",
+    "diesel engines", "motores diésel", "motores diesel",
+    "gas turbine", "turbina de gas",
+    "steam turbine", "turbina de vapor",
+    "combined cycle", "ciclo combinado",
+    "cogeneration", "cogeneración", "cogeneracion",
+    "non-renewable waste", "residuos no renovables",
+    "pumped storage", "turbinación bombeo", "turbinacion bombeo",
+}
 
 
 def should_run_now(force: bool) -> bool:
@@ -65,45 +100,61 @@ def should_run_now(force: bool) -> bool:
     return False
 
 
-def fetch_generation_mix(target_date: date) -> dict:
-    """Fetch the full-day generation structure for the given date."""
-    start = f"{target_date.isoformat()}T00:00"
-    end = f"{target_date.isoformat()}T23:59"
+def fetch_generation_mix(start_dt: datetime, end_dt: datetime) -> dict:
+    """
+    Fetch the generation structure between start_dt and end_dt (both
+    Europe/Madrid-aware datetimes). Used to get "today so far" data:
+    from midnight up to the moment the report runs (~12:00).
+    """
     params = {
-        "start_date": start,
-        "end_date": end,
+        "start_date": start_dt.strftime("%Y-%m-%dT%H:%M"),
+        "end_date": end_dt.strftime("%Y-%m-%dT%H:%M"),
         "time_trunc": "day",
     }
-    log.info("Requesting REE generation mix for %s ...", target_date.isoformat())
+    log.info("Requesting REE generation mix from %s to %s ...", params["start_date"], params["end_date"])
     resp = requests.get(REE_API_URL, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
+def classify_technology(name: str) -> str:
+    """Classify a technology name as 'renewable', 'non-renewable', or 'unknown'."""
+    key = name.strip().lower()
+    if key in RENEWABLE_TECHNOLOGIES:
+        return "renewable"
+    if key in NON_RENEWABLE_TECHNOLOGIES:
+        return "non-renewable"
+    log.warning("Unrecognized technology %r — not counted in renewable/non-renewable totals.", name)
+    return "unknown"
+
+
 def parse_generation_mix(payload: dict) -> list[dict]:
     """
     Turn the raw REE API response into a clean list of:
-      {"name": str, "category": "Renovable"|"No-Renovable"|..., "mwh": float, "pct": float, "color": str}
-    sorted by MWh descending.
+      {"name": str, "category": "renewable"|"non-renewable"|"unknown", "mwh": float, "pct": float, "color": str}
+    sorted by MWh descending. Aggregate/rollup rows (e.g. "Total generation")
+    that REE includes alongside the individual technologies are dropped.
     """
     items = []
     for entry in payload.get("included", []):
         attrs = entry.get("attributes", {})
         name = attrs.get("title") or entry.get("type") or "Unknown"
-        category = entry.get("type") or attrs.get("type") or "Unknown"
-        color = attrs.get("color") or None
 
+        if any(kw in name.strip().lower() for kw in AGGREGATE_ROW_KEYWORDS):
+            log.info("Skipping aggregate row %r", name)
+            continue
+
+        color = attrs.get("color") or None
         total = attrs.get("total")
         if total is None:
             # Fall back to summing the individual time-bucket values
             total = sum(v.get("value", 0) or 0 for v in attrs.get("values", []))
 
-        pct = attrs.get("total-percentage")
         items.append({
             "name": name,
-            "category": category,
+            "category": classify_technology(name),
             "mwh": float(total or 0),
-            "pct": float(pct) * 100 if pct is not None else None,
+            "pct": None,  # computed below, after aggregate rows are excluded
             "color": color,
         })
 
@@ -111,8 +162,7 @@ def parse_generation_mix(payload: dict) -> list[dict]:
 
     total_mwh = sum(i["mwh"] for i in items) or 1  # avoid div-by-zero
     for i in items:
-        if i["pct"] is None:
-            i["pct"] = i["mwh"] / total_mwh * 100
+        i["pct"] = i["mwh"] / total_mwh * 100
 
     # Assign fallback colours to anything missing one
     fallback_iter = iter(FALLBACK_COLORS * 3)
@@ -125,13 +175,12 @@ def parse_generation_mix(payload: dict) -> list[dict]:
 
 def compute_summary(items: list[dict]) -> dict:
     total_mwh = sum(i["mwh"] for i in items)
-    renewable_mwh = sum(i["mwh"] for i in items if i["category"] == "Renovable")
-    non_renewable_mwh = sum(i["mwh"] for i in items if i["category"] == "No-Renovable")
+    renewable_mwh = sum(i["mwh"] for i in items if i["category"] == "renewable")
+    non_renewable_mwh = sum(i["mwh"] for i in items if i["category"] == "non-renewable")
     other_mwh = total_mwh - renewable_mwh - non_renewable_mwh
 
     top_source = items[0] if items else None
-    # Largest non-zero renewable / non-renewable source, handy for the summary
-    top_renewable = next((i for i in items if i["category"] == "Renovable"), None)
+    top_renewable = next((i for i in items if i["category"] == "renewable"), None)
 
     return {
         "total_mwh": total_mwh,
@@ -193,7 +242,7 @@ def build_pie_chart(items: list[dict], out_path: str, small_slice_threshold: flo
     log.info("Pie chart saved to %s", out_path)
 
 
-def build_email_html(report_date: date, items: list[dict], summary: dict, image_cid: str) -> str:
+def build_email_html(report_dt: datetime, items: list[dict], summary: dict, image_cid: str) -> str:
     def fmt_gwh(mwh: float) -> str:
         return f"{mwh / 1000:,.1f} GWh"
 
@@ -219,7 +268,10 @@ def build_email_html(report_date: date, items: list[dict], summary: dict, image_
 <html>
   <body style="font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#222; max-width:640px; margin:auto;">
     <h2 style="margin-bottom:0;">⚡ Spain Electricity Generation Report</h2>
-    <p style="color:#666; margin-top:4px;">Data for {report_date.strftime('%A, %d %B %Y')} — source: Red Eléctrica de España (REData API)</p>
+    <p style="color:#666; margin-top:4px;">
+      {report_dt.strftime('%A, %d %B %Y')} — cumulative from 00:00 to {report_dt.strftime('%H:%M')} —
+      source: Red Eléctrica de España (REData API)
+    </p>
 
     <div style="background:#f6f8fa; border-radius:8px; padding:16px 20px; margin:16px 0;">
       <table style="width:100%; border-collapse:collapse; font-size:14px;">
@@ -318,22 +370,23 @@ def main() -> int:
     if not should_run_now(force):
         return 0
 
-    report_date = date.today() - timedelta(days=1)  # yesterday, full day of data
+    now_madrid = datetime.now(MADRID_TZ)
+    start_of_day = now_madrid.replace(hour=0, minute=0, second=0, microsecond=0)
 
     try:
-        payload = fetch_generation_mix(report_date)
+        payload = fetch_generation_mix(start_of_day, now_madrid)
         items = parse_generation_mix(payload)
         if not items:
-            raise RuntimeError("REE API returned no generation data for the requested date.")
+            raise RuntimeError("REE API returned no generation data for the requested window.")
 
         summary = compute_summary(items)
 
         chart_path = "/tmp/generation_mix.png"
         build_pie_chart(items, chart_path)
 
-        html = build_email_html(report_date, items, summary, image_cid="generation_mix")
+        html = build_email_html(now_madrid, items, summary, image_cid="generation_mix")
         subject = (
-            f"⚡ Spain grid report {report_date.isoformat()} — "
+            f"⚡ Spain grid report {now_madrid.strftime('%Y-%m-%d %H:%M')} — "
             f"{summary['renewable_pct']:.0f}% renewable"
         )
         send_email(subject, html, chart_path, image_cid="generation_mix")
