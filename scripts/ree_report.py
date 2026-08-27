@@ -78,24 +78,32 @@ def should_run_now(force: bool) -> bool:
     GitHub Actions cron always runs in UTC, but we want this to fire at
     ~12:00 *local* Madrid time year-round, including across the CET/CEST
     daylight-saving switch. The workflow schedules TWO cron triggers
-    (one for each UTC offset Madrid can have); this function checks the
-    actual local time at run time and only proceeds if it's close to
-    noon, skipping the "wrong" one of the two triggers on any given day.
+    (one for each UTC offset Madrid can have, ~60 minutes apart); this
+    function checks the actual local time at run time and only proceeds
+    if it's close to noon, skipping the "wrong" one of the two triggers
+    on any given day.
+
+    GitHub documents scheduled ("cron") triggers as best-effort: they can
+    be delayed by tens of minutes (rarely more) during periods of high
+    load, or in rare cases dropped entirely. To absorb typical delays
+    without risking a double-send, we accept a window of +/- 30 minutes
+    around noon — comfortably inside the ~60 minute gap between the two
+    scheduled triggers, so only one of them will ever pass on a given day.
     """
     if force:
         log.info("FORCE_RUN set — skipping local-time check.")
         return True
 
     now_madrid = datetime.now(MADRID_TZ)
-    # Allow a generous +/- window so slight GitHub Actions scheduling
-    # delays (it's a best-effort scheduler, can be several minutes late)
-    # don't cause the report to be silently skipped.
-    if now_madrid.hour == 12:
+    minutes_from_noon = (now_madrid.hour * 60 + now_madrid.minute) - 12 * 60
+
+    if abs(minutes_from_noon) <= 30:
         return True
 
     log.info(
-        "Current Madrid local time is %s — not the scheduled hour (12:00), skipping this trigger.",
+        "Current Madrid local time is %s (%+d min from noon) — outside the accepted window, skipping this trigger.",
         now_madrid.strftime("%Y-%m-%d %H:%M %Z"),
+        minutes_from_noon,
     )
     return False
 
