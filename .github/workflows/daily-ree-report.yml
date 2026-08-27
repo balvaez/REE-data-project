@@ -7,8 +7,11 @@ on:
     # BOTH corresponding UTC times to cover 12:00 local time year-round.
     # The script itself checks the real local time and skips the
     # "wrong" one of the two triggers on any given day.
-    - cron: '0 10 * * *'   # 12:00 in Madrid during CEST (summer)
-    - cron: '0 11 * * *'   # 12:00 in Madrid during CET (winter)
+    # Offset a few minutes from the top of the hour: exactly-on-the-hour
+    # triggers (e.g. '0 10 * * *') are the most prone to GitHub's
+    # scheduling delays/drops during load spikes.
+    - cron: '6 10 * * *'   # ~12:00 in Madrid during summer (CEST)
+    - cron: '6 11 * * *'   # ~12:00 in Madrid during winter (CET)
   workflow_dispatch:
     inputs:
       force:
