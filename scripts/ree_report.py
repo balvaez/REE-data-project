@@ -8,8 +8,13 @@ the script runs, ~12:00) from Red Eléctrica de España's public REData API
 generation mix, and emails a summary (key figures + chart) to the
 configured recipient.
 
-Designed to be run once a day (around 12:00 Europe/Madrid time) from a
-GitHub Actions workflow, but works fine run locally / manually too.
+Designed to be run many times a day (dense around midday, with a sparser
+fallback net through the rest of the day) from a GitHub Actions workflow.
+A committed state file tracks whether today's report was already sent,
+so only the first successful run each day actually emails anything —
+this makes the whole thing resilient to GitHub's best-effort, sometimes-
+delayed-or-dropped scheduled ("cron") triggers. Works fine run locally /
+manually too.
 """
 
 import os
@@ -18,6 +23,7 @@ import smtplib
 import logging
 from datetime import datetime
 from email.message import EmailMessage
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -30,6 +36,12 @@ log = logging.getLogger("ree_report")
 
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 REE_API_URL = "https://apidatos.ree.es/en/datos/generacion/estructura-generacion"
+
+# Where we record the date (Europe/Madrid) of the last successfully-sent
+# report. Path is relative to the repo root (the workflow runs the script
+# from there). Committed back to the repo by the workflow after each run
+# so the "already sent today?" check survives across separate CI runs.
+STATE_FILE = Path("state/last_sent.txt")
 
 # Fallback colour palette for technologies that don't have a colour
 # provided by the API (shouldn't normally happen, but just in case).
@@ -73,39 +85,26 @@ NON_RENEWABLE_TECHNOLOGIES = {
 }
 
 
-def should_run_now(force: bool) -> bool:
+def already_sent_today(today_str: str) -> bool:
     """
-    GitHub Actions cron always runs in UTC, but we want this to fire at
-    ~12:00 *local* Madrid time year-round, including across the CET/CEST
-    daylight-saving switch. The workflow schedules TWO cron triggers
-    (one for each UTC offset Madrid can have, ~60 minutes apart); this
-    function checks the actual local time at run time and only proceeds
-    if it's close to noon, skipping the "wrong" one of the two triggers
-    on any given day.
-
-    GitHub documents scheduled ("cron") triggers as best-effort: they can
-    be delayed by tens of minutes (rarely more) during periods of high
-    load, or in rare cases dropped entirely. To absorb typical delays
-    without risking a double-send, we accept a window of +/- 30 minutes
-    around noon — comfortably inside the ~60 minute gap between the two
-    scheduled triggers, so only one of them will ever pass on a given day.
+    Check whether a report was already successfully sent today, based on
+    the committed state file. GitHub Actions cron triggers are best-effort
+    and can be delayed or dropped entirely, so instead of gating on a
+    specific time of day, the workflow fires many times throughout the
+    day and this check ensures only the first successful run each day
+    actually sends an email — every other trigger that day is a cheap no-op.
     """
-    if force:
-        log.info("FORCE_RUN set — skipping local-time check.")
-        return True
+    try:
+        last_sent = STATE_FILE.read_text().strip()
+    except FileNotFoundError:
+        return False
+    return last_sent == today_str
 
-    now_madrid = datetime.now(MADRID_TZ)
-    minutes_from_noon = (now_madrid.hour * 60 + now_madrid.minute) - 12 * 60
 
-    if abs(minutes_from_noon) <= 30:
-        return True
-
-    log.info(
-        "Current Madrid local time is %s (%+d min from noon) — outside the accepted window, skipping this trigger.",
-        now_madrid.strftime("%Y-%m-%d %H:%M %Z"),
-        minutes_from_noon,
-    )
-    return False
+def mark_sent_today(today_str: str) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(today_str + "\n")
+    log.info("Recorded %s in %s", today_str, STATE_FILE)
 
 
 def fetch_generation_mix(start_dt: datetime, end_dt: datetime) -> dict:
@@ -375,10 +374,13 @@ def send_failure_email(error_text: str) -> None:
 def main() -> int:
     force = os.environ.get("FORCE_RUN", "").lower() in ("1", "true", "yes")
 
-    if not should_run_now(force):
+    now_madrid = datetime.now(MADRID_TZ)
+    today_str = now_madrid.date().isoformat()
+
+    if not force and already_sent_today(today_str):
+        log.info("Report already sent today (%s) — skipping this trigger.", today_str)
         return 0
 
-    now_madrid = datetime.now(MADRID_TZ)
     start_of_day = now_madrid.replace(hour=0, minute=0, second=0, microsecond=0)
 
     try:
@@ -398,6 +400,7 @@ def main() -> int:
             f"{summary['renewable_pct']:.0f}% renewable"
         )
         send_email(subject, html, chart_path, image_cid="generation_mix")
+        mark_sent_today(today_str)
 
     except Exception as e:  # noqa: BLE001
         log.exception("Report generation failed")
