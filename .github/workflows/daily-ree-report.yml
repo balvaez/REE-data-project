@@ -2,27 +2,43 @@ name: Daily REE Generation Report
 
 on:
   schedule:
-    # GitHub Actions cron always runs in UTC. Spain (Europe/Madrid) is
-    # UTC+1 in winter (CET) and UTC+2 in summer (CEST), so we schedule
-    # BOTH corresponding UTC times to cover 12:00 local time year-round.
-    # The script itself checks the real local time and skips the
-    # "wrong" one of the two triggers on any given day.
-    # Offset a few minutes from the top of the hour: exactly-on-the-hour
-    # triggers (e.g. '0 10 * * *') are the most prone to GitHub's
-    # scheduling delays/drops during load spikes.
-    - cron: '6 10 * * *'   # ~12:00 in Madrid during summer (CEST)
-    - cron: '6 11 * * *'   # ~12:00 in Madrid during winter (CET)
+    # GitHub Actions scheduled ("cron") triggers are best-effort: GitHub
+    # documents that they can be delayed by tens of minutes, or in some
+    # cases dropped entirely, especially at high-load moments like the
+    # top of the hour. Relying on a single exact trigger time is not
+    # reliable enough, so instead we fire MANY times a day and let the
+    # script itself decide whether a report still needs sending (see
+    # scripts/ree_report.py — it checks a committed state file and skips
+    # if today's report already went out). Whichever trigger is the
+    # first to actually run each day is the one that sends the email;
+    # every other trigger that day is a cheap few-second no-op.
+    #
+    # Dense coverage around midday (every 15 min, 09:00-14:00 UTC) —
+    # comfortably brackets 12:00 Madrid local time across both CET
+    # (UTC+1) and CEST (UTC+2), with margin for delays.
+    - cron: '*/15 9-14 * * *'
+    # Sparse fallback net for the rest of the day, in case every
+    # midday attempt above got delayed or dropped — catches up hourly
+    # through the evening so the report still arrives "late" rather
+    # than not at all.
+    - cron: '0 15-21 * * *'
   workflow_dispatch:
     inputs:
       force:
-        description: 'Run immediately, ignoring the 12:00 local-time check'
+        description: 'Send now even if todays report was already sent'
         type: boolean
         default: true
+
+permissions:
+  contents: write   # needed to commit the "already sent today" state file back to the repo
 
 jobs:
   send-report:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: ree-daily-report
+      cancel-in-progress: false
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -45,3 +61,15 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           FORCE_RUN: ${{ inputs.force }}
         run: python scripts/ree_report.py
+
+      - name: Record that today's report was sent
+        run: |
+          if [ -n "$(git status --porcelain state/last_sent.txt 2>/dev/null)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state/last_sent.txt
+            git commit -m "chore: record report sent for $(cat state/last_sent.txt)"
+            git push
+          else
+            echo "No state change — report was not sent this run (already sent today, or it failed)."
+          fi
