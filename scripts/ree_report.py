@@ -403,9 +403,16 @@ def main() -> int:
         mark_sent_today(today_str)
 
     except Exception as e:  # noqa: BLE001
-        log.exception("Report generation failed")
-        send_failure_email(f"{type(e).__name__}: {e}")
-        return 1
+        # The workflow retries many times a day, so a single failed attempt
+        # is not a problem: log it and exit cleanly so GitHub doesn't send
+        # a "workflow failed" notification. Only on the final attempts of
+        # the evening (when no later retry will rescue the day) do we send
+        # a failure email, since that means no report went out today.
+        log.exception("Report attempt failed")
+        if now_madrid.hour >= 22:
+            send_failure_email(f"No report could be sent today. Last error: {type(e).__name__}: {e}")
+        else:
+            log.info("A later trigger will retry.")
 
     return 0
 
