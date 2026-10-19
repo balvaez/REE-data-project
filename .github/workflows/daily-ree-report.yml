@@ -36,6 +36,10 @@ jobs:
   send-report:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # A single failed attempt is harmless: the workflow retries many times
+    # a day. Marking the job as non-fatal keeps the run green so GitHub
+    # doesn't email a "workflow failed" notification for each hiccup.
+    continue-on-error: true
     concurrency:
       group: ree-daily-report
       cancel-in-progress: false
